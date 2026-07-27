@@ -11,6 +11,7 @@ const errorHandler = require('./middleware/errorHandler');
 
 // ─── Load Environment Variables ───────────────────────────────────────────────
 dotenv.config();
+console.log(process.env.MONGODB_URI)
 
 // Connect to MongoDB & Kafka Producer
 connectDB();
