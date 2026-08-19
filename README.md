@@ -452,4 +452,4 @@ For issues, questions, or feature requests, please open a [GitHub Issue](https:/
 
 ---
 
-**Built with ❤️ by [Naman Khanduja](https://github.com/NamanKhanduja)**
+**Built with ❤️ by [Durgesh Yadav](https://github.com/Durgesh-0001)**
