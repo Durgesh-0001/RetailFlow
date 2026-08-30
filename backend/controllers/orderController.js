@@ -47,6 +47,11 @@ exports.createOrder = async (req, res, next) => {
     const { customer, items, discount = 0, notes } = req.body;
 
     if (!items || items.length === 0) {
+      // The transaction session was already started above — abort and end
+      // it before bailing out, otherwise this leaves a hanging transaction
+      // open on the connection every time someone submits an empty cart.
+      await session.abortTransaction();
+      session.endSession();
       return next(new ErrorResponse('Order must contain at least one item.', 400));
     }
 
@@ -156,13 +161,46 @@ exports.updateOrderStatus = async (req, res, next) => {
 // ─── @route DELETE /api/v1/orders/:id
 // ─── @access Protected
 exports.deleteOrder = async (req, res, next) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const order = await Order.findOneAndDelete({ _id: req.params.id, shop: req.user._id });
+    const order = await Order.findOne({ _id: req.params.id, shop: req.user._id }).session(session);
 
-    if (!order) return next(new ErrorResponse('Order not found.', 404));
+    if (!order) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(new ErrorResponse('Order not found.', 404));
+    }
 
-    res.status(200).json({ success: true, message: 'Order deleted successfully.' });
+    // Restore the stock that was deducted at creation time. The previous
+    // version deleted the order outright without giving inventory back,
+    // so every deleted/cancelled order permanently lost that stock.
+    for (const item of order.items) {
+      await Product.findByIdAndUpdate(
+        item.product,
+        { $inc: { quantity: item.quantity } },
+        { session }
+      );
+    }
+
+    // If the order had already been marked Completed, updateOrderStatus
+    // auto-created a matching Sale record for it. Deleting the order
+    // without deleting that Sale left a dangling record pointing at a
+    // non-existent order and kept inflating revenue/profit reports.
+    if (order.status === 'Completed') {
+      await Sale.findOneAndDelete({ order: order._id, shop: req.user._id }).session(session);
+    }
+
+    await Order.findByIdAndDelete(order._id).session(session);
+
+    await session.commitTransaction();
+    session.endSession();
+
+    res.status(200).json({ success: true, message: 'Order deleted successfully and stock restored.' });
   } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
     next(err);
   }
 };

@@ -452,4 +452,8 @@ Contributions are welcome! Please follow the development workflow and ensure you
 
 ---
 
+<<<<<<< HEAD
 
+=======
+**Built with ❤️ by [Durgesh Yadav](https://github.com/Durgesh-0001)**
+>>>>>>> 9e03ea5ef241ab9f235757aad27f8d327e770801
