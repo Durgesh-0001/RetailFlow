@@ -152,17 +152,38 @@ exports.markAttendance = async (req, res, next) => {
   try {
     const entries = Array.isArray(req.body.records) ? req.body.records : [req.body];
 
-    const ops = entries.map((entry) => ({
-      updateOne: {
-        filter: {
-          shop: req.user._id,
-          employee: entry.employee,
-          date: new Date(new Date(entry.date).setHours(0, 0, 0, 0)),
+    if (entries.length === 0) {
+      return next(new ErrorResponse('No attendance records provided.', 400));
+    }
+
+    const ops = entries.map((entry) => {
+      if (!entry.employee || !entry.date || !entry.status) {
+        throw new ErrorResponse('Each attendance record requires employee, date, and status.', 400);
+      }
+
+      // Normalize the date to midnight ONCE and reuse it for both the filter
+      // and the stored value. Previously the filter matched against a
+      // normalized midnight date, but the update wrote back the raw,
+      // un-normalized entry.date. That mismatch meant marking the same
+      // employee twice on the same day would never match the first record,
+      // silently creating a duplicate row instead of updating it.
+      const normalizedDate = new Date(entry.date);
+      normalizedDate.setHours(0, 0, 0, 0);
+
+      return {
+        updateOne: {
+          filter: {
+            shop: req.user._id,
+            employee: entry.employee,
+            date: normalizedDate,
+          },
+          update: {
+            $set: { ...entry, shop: req.user._id, date: normalizedDate },
+          },
+          upsert: true, // Create if not exists, update if it does
         },
-        update: { $set: { ...entry, shop: req.user._id } },
-        upsert: true, // Create if not exists, update if it does
-      },
-    }));
+      };
+    });
 
     await Attendance.bulkWrite(ops);
 

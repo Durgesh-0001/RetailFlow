@@ -1,6 +1,12 @@
 const Product = require('../models/Product');
 const ErrorResponse = require('../utils/errorResponse');
 
+// Escape regex special characters in user-supplied search terms before
+// dropping them into a $regex query. Without this, a search like "a(b"
+// throws an invalid-regex error (500), and characters like ".*" let a
+// caller build unintended wildcard/DoS-prone patterns.
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // ─── @desc  Get all products for the logged-in shop
 // ─── @route GET /api/v1/products
 // ─── @access Protected
@@ -10,8 +16,8 @@ exports.getProducts = async (req, res, next) => {
 
     const query = { shop: req.user._id };
 
-    if (category) query.category = { $regex: category, $options: 'i' };
-    if (search)   query.name     = { $regex: search,   $options: 'i' };
+    if (category) query.category = { $regex: escapeRegex(category), $options: 'i' };
+    if (search)   query.name     = { $regex: escapeRegex(search),   $options: 'i' };
 
     let products = await Product.find(query).sort({ createdAt: -1 });
 

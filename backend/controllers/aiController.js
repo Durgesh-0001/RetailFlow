@@ -25,12 +25,27 @@ const { getLowStockPredictions } = require('../utils/demandPredictor');
 const { getPairingRules }      = require('../utils/pairingEngine');
 
 // ── Initialise Gemini client once at server start ────────────────────────────
+// Previously this skipped the "is the key even set" check that
+// orchestratorController.js does, so with no GEMINI_API_KEY the SDK could
+// construct a client object without throwing, `ai` would stay truthy, and
+// every request would pass the `if (!ai)` guard below only to fail deep
+// inside the Gemini call instead of failing fast with a clear message.
 let ai = null;
 try {
-  ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  if (process.env.GEMINI_API_KEY) {
+    ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  } else {
+    console.warn('[RetailFlow AI] GEMINI_API_KEY not set — AI voice features disabled.');
+  }
 } catch (e) {
   console.warn('[RetailFlow AI] Gemini client not initialised — check GEMINI_API_KEY.');
 }
+
+// Escape regex special characters in voice-transcribed names before they're
+// dropped into a $regex query. Without this, a product/employee name
+// containing characters like "(" or "*" either throws an invalid-regex
+// error or builds an unintended wildcard pattern.
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PERFORMANCE CACHE — Store heavy database aggregations in memory (5 min cache)
@@ -184,19 +199,25 @@ async function fetchContextData(shopId) {
   const [lowList, pairRules, orders, sales, products] = await Promise.all([
     lowStockPromise,
     pairingPromise,
-    Order.find({ shop: shopId, createdAt: { $gte: todayStart } }).select('finalAmount').lean(),
+    Order.find({ shop: shopId, createdAt: { $gte: todayStart } }).select('_id').lean(),
     Sale.find({ shop: shopId, date: { $gte: todayStart } }).select('revenue profit').lean(),
     Product.find({ shop: shopId }).select('name sellingPrice unit').lean(),
   ]);
 
-  const orderRevenue = orders.reduce((s, o) => s + (o.finalAmount || 0), 0);
-  const saleRevenue  = sales.reduce((s, x) => s + (x.revenue   || 0), 0);
-  const saleProfit   = sales.reduce((s, x) => s + (x.profit    || 0), 0);
-  
+  // Revenue must come from the Sale collection ONLY. Every completed order
+  // already gets a mirrored Sale record — both orderController's
+  // updateOrderStatus and the PLACE_ORDER branch below create one — so
+  // also summing Order.finalAmount here double-counted that same revenue.
+  // Worse, this summed ALL orders regardless of status, so Pending/
+  // Processing/Cancelled orders (which haven't generated any revenue yet)
+  // were being reported as revenue too.
+  const saleRevenue = sales.reduce((s, x) => s + (x.revenue || 0), 0);
+  const saleProfit  = sales.reduce((s, x) => s + (x.profit  || 0), 0);
+
   const dailySales = {
-    revenue:    orderRevenue + saleRevenue,
+    revenue:    saleRevenue,
     profit:     saleProfit,
-    orderCount: orders.length,
+    orderCount: orders.length, // total orders placed today, any status
   };
 
   return { lowStockList: lowList, pairingRules: pairRules, dailySales, allProducts: products };
@@ -249,17 +270,22 @@ async function executeAction(intent, payload, shopId, pairingRules, aiResult) {
         // Check if product already exists (case-insensitive) to prevent duplicate inventory rows!
         let dbProd = await Product.findOne({
           shop: shopId,
-          name: { $regex: new RegExp(`^${item.productName.trim()}$`, 'i') }
+          name: { $regex: new RegExp(`^${escapeRegex(item.productName.trim())}$`, 'i') }
         });
 
         if (dbProd) {
-          // Increment existing product quantity instead of creating a duplicate row!
-          dbProd.quantity += qty;
-          if (item.price && item.price > 0) {
-            dbProd.sellingPrice = item.price;
-            dbProd.costPrice = item.costPrice || (item.price * 0.7);
-          }
-          await dbProd.save();
+          // Atomic $inc instead of read-mutate-save. The old read-then-write
+          // pattern could lose an update if two ADD_PRODUCT voice commands
+          // for the same product landed at nearly the same time.
+          const priceUpdate = (item.price && item.price > 0)
+            ? { sellingPrice: item.price, costPrice: item.costPrice || (item.price * 0.7) }
+            : {};
+
+          dbProd = await Product.findOneAndUpdate(
+            { _id: dbProd._id },
+            { $inc: { quantity: qty }, $set: priceUpdate },
+            { new: true }
+          );
           addedSummary.push(`${qty} ${dbProd.name}`);
         } else {
           // Determine non-zero price and cost using intelligent fallback heuristics
@@ -330,10 +356,10 @@ async function executeAction(intent, payload, shopId, pairingRules, aiResult) {
 
         let dbProd = await Product.findOne({
           shop: shopId,
-          name: { $regex: new RegExp(`^${item.productName.trim()}$`, 'i') }
+          name: { $regex: new RegExp(`^${escapeRegex(item.productName.trim())}$`, 'i') }
         });
 
-        const qty = Number(item.quantity || 1);
+        const requestedQty = Number(item.quantity || 1);
 
         if (!dbProd) {
           // AUTO-CREATION IN INVENTORY: Missing products are automatically created first!
@@ -352,34 +378,62 @@ async function executeAction(intent, payload, shopId, pairingRules, aiResult) {
             sku:          generatedSku,
             costPrice:    cost,
             sellingPrice: price,
-            quantity:     qty + 10,
+            quantity:     requestedQty + 10,
             unit:         item.unit || 'pcs',
           });
         }
 
-        // Deduct inventory stock
-        if (dbProd.quantity < qty) {
-          dbProd.quantity = 0;
-        } else {
-          dbProd.quantity -= qty;
-        }
-        await dbProd.save();
+        // Only ever sell what's actually on the shelf. The old code did a
+        // read-then-write (findOne → mutate in JS → save) and, if stock was
+        // short, silently zeroed the shelf quantity while STILL billing the
+        // customer for the full requested amount — overselling and hiding
+        // a real inventory shortfall. This caps the sale at what's
+        // available, and uses one atomic conditional update so two
+        // concurrent orders can't both read the same stock count and both
+        // "succeed" in selling it.
+        const fulfilledQty = Math.min(requestedQty, dbProd.quantity);
 
-        const subtotal = dbProd.sellingPrice * qty;
+        if (fulfilledQty <= 0) {
+          orderSummary.push(`0 ${dbProd.name} (out of stock)`);
+          continue;
+        }
+
+        const updatedProd = await Product.findOneAndUpdate(
+          { _id: dbProd._id, quantity: { $gte: fulfilledQty } },
+          { $inc: { quantity: -fulfilledQty } },
+          { new: true }
+        );
+
+        // Another order beat us to the remaining stock between our read
+        // and this update — skip rather than sell stock that no longer
+        // exists.
+        if (!updatedProd) {
+          orderSummary.push(`0 ${dbProd.name} (out of stock)`);
+          continue;
+        }
+
+        const subtotal = updatedProd.sellingPrice * fulfilledQty;
         totalAmount += subtotal;
-        totalCOGS   += dbProd.costPrice * qty;
+        totalCOGS   += updatedProd.costPrice * fulfilledQty;
 
         orderItems.push({
-          product:     dbProd._id,
-          productName: dbProd.name,
-          sku:         dbProd.sku,
-          unitPrice:   dbProd.sellingPrice,
-          costPrice:   dbProd.costPrice,
-          quantity:    qty,
+          product:     updatedProd._id,
+          productName: updatedProd.name,
+          sku:         updatedProd.sku,
+          unitPrice:   updatedProd.sellingPrice,
+          costPrice:   updatedProd.costPrice,
+          quantity:    fulfilledQty,
           subtotal
         });
 
-        orderSummary.push(`${qty} ${dbProd.name}`);
+        const shortfallNote = fulfilledQty < requestedQty ? ` (only ${fulfilledQty} in stock)` : '';
+        orderSummary.push(`${fulfilledQty} ${updatedProd.name}${shortfallNote}`);
+      }
+
+      if (orderItems.length === 0) {
+        internalData = 'None of the requested items are in stock.';
+        if (aiResult) aiResult.spokenResponse = 'Sorry, stock khatam hai.';
+        break;
       }
 
       // Create a completed Mongoose Order document
@@ -412,12 +466,14 @@ async function executeAction(intent, payload, shopId, pairingRules, aiResult) {
       });
       
       internalData = `Order logged. Total ₹${totalAmount}.`;
-      // Override provisional spokenResponse with precise computed total for safety
+      // Override provisional spokenResponse with precise computed total for safety.
+      // Previously both branches of this language check produced the exact
+      // same English string, so the Hindi detection did nothing.
       if (aiResult) {
         const lang = (aiResult.spokenResponse || '').match(/[\u0900-\u097F]/) ? 'hi' : 'en';
-        aiResult.spokenResponse = lang === 'hi' 
-          ? `Order logged. Total ₹${totalAmount}.`
-          : `Order logged. Total ₹${totalAmount}.`;
+        aiResult.spokenResponse = lang === 'hi'
+          ? `Order ho gaya. Total ₹${totalAmount}.`
+          : `Order placed. Total ₹${totalAmount}.`;
       }
       refreshRequired  = true;
       navigationTarget = '/orders';
@@ -433,7 +489,7 @@ async function executeAction(intent, payload, shopId, pairingRules, aiResult) {
       }
       const emp = await Employee.findOne({
         shop:     shopId,
-        name:     { $regex: new RegExp(payload.employeeName.trim(), 'i') },
+        name:     { $regex: new RegExp(escapeRegex(payload.employeeName.trim()), 'i') },
         isActive: true,
       });
       if (!emp) {
@@ -550,7 +606,7 @@ exports.processVoiceCommand = async (req, res) => {
     const { text, history } = req.body;
     if (!text) return res.status(400).json({ message: 'No text provided.' });
 
-    const shopId = req.user.id; // Mongoose auto-casts string → ObjectId in queries
+    const shopId = req.user._id; // consistent with every other controller (avoids relying on the string `id` virtual)
 
     // ── A: Fetch live context data (utilizes 0ms in-memory cache) ──────────
     const { lowStockList, pairingRules, dailySales, allProducts } =

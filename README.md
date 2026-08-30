@@ -448,8 +448,8 @@ Contributions are welcome! Please follow the development workflow and ensure you
 
 ## 📧 Support
 
-For issues, questions, or feature requests, please open a [GitHub Issue](https://github.com/NamanKhanduja/RetailFlow/issues).
+
 
 ---
 
-**Built with ❤️ by [Naman Khanduja](https://github.com/NamanKhanduja)**
+
