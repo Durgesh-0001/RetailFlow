@@ -21,7 +21,7 @@ const Sale = require('../models/Sale');
 connectDB();
 
 // ── 2. INITIALISE REDIS CONNECTION POOL ──────────────────────────────────────
-const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+const redisUrl = process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || '127.0.0.1'}:${process.env.REDIS_PORT || '6379'}`;
 console.log(`🔌 Connecting Redis client to: ${redisUrl}...`);
 
 const redis = new Redis(redisUrl, {
