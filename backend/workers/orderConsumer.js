@@ -21,7 +21,7 @@ const Sale = require('../models/Sale');
 connectDB();
 
 // ── 2. INITIALISE REDIS CONNECTION POOL ──────────────────────────────────────
-const redisUrl = process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || '127.0.0.1'}:${process.env.REDIS_PORT || '6379'}`;
+const redisUrl = process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || '127.0.0.1'}:${process.env.REDIS_PORT || '6380'}`;
 console.log(`🔌 Connecting Redis client to: ${redisUrl}...`);
 
 const redis = new Redis(redisUrl, {
@@ -39,7 +39,7 @@ redis.on('connect', () => console.log('✅ Redis connection established successf
 redis.on('error', (err) => console.error('❌ Redis connection pool error:', err.message));
 
 // ── 3. INITIALISE KAFKA CLIENT & CONSUMER ────────────────────────────────────
-const brokerString = process.env.KAFKA_BROKERS || 'localhost:9092';
+const brokerString = process.env.KAFKA_BROKERS || 'localhost:9094';
 const brokers = brokerString.split(',').map(b => b.trim());
 
 const kafka = new Kafka({
