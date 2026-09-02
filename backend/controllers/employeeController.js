@@ -8,8 +8,6 @@ const ErrorResponse = require('../utils/errorResponse');
 exports.getEmployees = async (req, res, next) => {
   try {
     const filter = { shop: req.user._id };
-
-    // By default only return active employees; pass ?all=true for deactivated too
     if (req.query.all !== 'true') filter.isActive = true;
 
     const employees = await Employee.find(filter).sort({ name: 1 });
@@ -70,7 +68,7 @@ exports.updateEmployee = async (req, res, next) => {
   }
 };
 
-// ─── @desc  Soft-delete an employee (set isActive = false)
+// ─── @desc  Soft-delete an employee
 // ─── @route DELETE /api/v1/employees/:id
 // ─── @access Protected
 exports.deleteEmployee = async (req, res, next) => {
@@ -138,7 +136,14 @@ exports.getMonthlyAttendance = async (req, res, next) => {
       { Present: 0, Absent: 0, 'Half-Day': 0, Leave: 0 }
     );
 
-    res.status(200).json({ success: true, employee: { id: employee._id, name: employee.name }, month, year, summary, data: records });
+    res.status(200).json({
+      success: true,
+      employee: { id: employee._id, name: employee.name },
+      month,
+      year,
+      summary,
+      data: records,
+    });
   } catch (err) {
     next(err);
   }
@@ -147,7 +152,6 @@ exports.getMonthlyAttendance = async (req, res, next) => {
 // ─── @desc  Mark attendance (single or bulk)
 // ─── @route POST /api/v1/employees/attendance
 // ─── @access Protected
-// Body: { records: [{ employee, date, status, notes }] }  OR single { employee, date, status }
 exports.markAttendance = async (req, res, next) => {
   try {
     const entries = Array.isArray(req.body.records) ? req.body.records : [req.body];
@@ -161,12 +165,6 @@ exports.markAttendance = async (req, res, next) => {
         throw new ErrorResponse('Each attendance record requires employee, date, and status.', 400);
       }
 
-      // Normalize the date to midnight ONCE and reuse it for both the filter
-      // and the stored value. Previously the filter matched against a
-      // normalized midnight date, but the update wrote back the raw,
-      // un-normalized entry.date. That mismatch meant marking the same
-      // employee twice on the same day would never match the first record,
-      // silently creating a duplicate row instead of updating it.
       const normalizedDate = new Date(entry.date);
       normalizedDate.setHours(0, 0, 0, 0);
 
@@ -180,7 +178,7 @@ exports.markAttendance = async (req, res, next) => {
           update: {
             $set: { ...entry, shop: req.user._id, date: normalizedDate },
           },
-          upsert: true, // Create if not exists, update if it does
+          upsert: true,
         },
       };
     });
@@ -193,7 +191,7 @@ exports.markAttendance = async (req, res, next) => {
   }
 };
 
-// ─── @desc  Correct a single attendance record
+// ─── @desc  Update a single attendance record
 // ─── @route PUT /api/v1/employees/attendance/:id
 // ─── @access Protected
 exports.updateAttendance = async (req, res, next) => {

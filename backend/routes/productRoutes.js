@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
+const cacheMiddleware = require('../middleware/cache');
 const {
   getProducts,
   getLowStockProducts,
@@ -11,11 +12,11 @@ const {
   deleteProduct,
 } = require('../controllers/productController');
 
-router.use(protect); // All product routes are protected
+router.use(protect);
 
-router.get('/low-stock', getLowStockProducts); // Must be before /:id
-router.route('/').get(getProducts).post(createProduct);
-router.route('/:id').get(getProduct).put(updateProduct).delete(deleteProduct);
+router.route('/').get(cacheMiddleware(120), getProducts).post(createProduct);
+router.route('/low-stock').get(cacheMiddleware(60), getLowStockProducts);
+router.route('/:id').get(cacheMiddleware(120), getProduct).put(updateProduct).delete(deleteProduct);
 router.patch('/:id/stock', adjustStock);
 
 module.exports = router;

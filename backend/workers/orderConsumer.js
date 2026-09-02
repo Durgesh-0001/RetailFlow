@@ -1,222 +1,181 @@
 /**
- * workers/orderConsumer.js  —  RetailFlow Asynchronous Order Consumer Worker
- * ═════════════════════════════════════════════════════════════════════════
- * Continuous background worker pulling from 'retailflow.orders.v1'.
- * Employs ioredis-backed idempotency protection and atomic Mongoose transactions.
+ * workers/orderConsumer.js — RetailFlow Asynchronous Order Processing Worker
+ * ─────────────────────────────────────────────────────────────────────────
+ * Continuous background worker subscribed to 'retailflow.orders.v1'.
+ * Consumer Group: 'retailflow-order-workers'
+ * Employs Redis-backed atomic idempotency protection and Mongoose transaction safety.
  */
 
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const mongoose = require('mongoose');
-const { Kafka, logLevel } = require('kafkajs');
-const Redis = require('ioredis');
-
+const { createConsumer, TOPICS } = require('../config/kafka');
 const connectDB = require('../config/db');
+const redisService = require('../services/redisService');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
 const Sale = require('../models/Sale');
 
-// ── 1. INITIALISE DATABASE CONNECTION ────────────────────────────────────────
-connectDB();
+const CONSUMER_GROUP = 'retailflow-order-workers';
+let consumer = null;
+let isRunning = false;
 
-// ── 2. INITIALISE REDIS CONNECTION POOL ──────────────────────────────────────
-const redisUrl = process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || '127.0.0.1'}:${process.env.REDIS_PORT || '6380'}`;
-console.log(`🔌 Connecting Redis client to: ${redisUrl}...`);
+async function startOrderConsumer() {
+  if (isRunning) return;
 
-const redis = new Redis(redisUrl, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: true,
-  reconnectOnError: (err) => {
-    if (err.message.includes('READONLY')) {
-      return true; // Reconnect automatically on master-failovers (Redis Cluster)
-    }
-    return false;
-  }
-});
-
-redis.on('connect', () => console.log('✅ Redis connection established successfully.'));
-redis.on('error', (err) => console.error('❌ Redis connection pool error:', err.message));
-
-// ── 3. INITIALISE KAFKA CLIENT & CONSUMER ────────────────────────────────────
-const brokerString = process.env.KAFKA_BROKERS || 'localhost:9094';
-const brokers = brokerString.split(',').map(b => b.trim());
-
-const kafka = new Kafka({
-  clientId: 'retailflow-order-worker',
-  brokers: brokers,
-  logLevel: logLevel.WARN
-});
-
-const consumer = kafka.consumer({
-  groupId: 'retailflow-order-workers',
-  sessionTimeout: 30000,
-  heartbeatInterval: 10000
-});
-
-/**
- * Core consumer daemon bootstrapper
- */
-async function startConsumer() {
-  console.log(`🔌 Subscribing worker to topic 'retailflow.orders.v1'...`);
   try {
-    await consumer.connect();
-    await consumer.subscribe({ topic: 'retailflow.orders.v1', fromBeginning: true });
-    console.log('✅ Kafka Consumer worker successfully subscribed.');
+    await connectDB();
+    consumer = createConsumer(CONSUMER_GROUP);
 
-    // ── 4. EVENT POLLING LOOP ───────────────────────────────────────────────
+    console.log(`🔌 [OrderConsumer] Connecting and subscribing to '${TOPICS.ORDERS}' (Group: '${CONSUMER_GROUP}')...`);
+    await consumer.connect();
+    await consumer.subscribe({ topic: TOPICS.ORDERS, fromBeginning: false });
+    isRunning = true;
+    console.log(`✅ [OrderConsumer] Successfully connected & subscribed to ${TOPICS.ORDERS}`);
+
     await consumer.run({
       eachMessage: async ({ topic, partition, message }) => {
         const correlationId = message.headers?.correlation_id?.toString() || message.key?.toString();
-        
-        let data;
+        let parsed;
+
         try {
-          data = JSON.parse(message.value.toString());
+          parsed = JSON.parse(message.value.toString());
         } catch (err) {
-          console.error(`❌ [Trace ID: ${correlationId}] Malformed JSON event parsed. Discarding:`, err.message);
+          console.error(`❌ [OrderConsumer] [Corr: ${correlationId}] Malformed JSON event:`, err.message);
           return;
         }
 
-        const requestId = data.request_id || message.key?.toString();
-        console.log(`📥 [Trace ID: ${correlationId}] [Kafka Consumer] Pulling order message. Partition: ${partition}`);
+        const { eventId, eventType, shopId, payload } = parsed;
 
-        // ── 5. IDEMPOTENCY GUARD LAYER (Redis check) ───────────────────────
-        const redisKey = `retailflow:order:idempotency:${requestId}`;
-        
-        const isDuplicate = await redis.get(redisKey);
-        if (isDuplicate) {
-          console.warn(`⚠️ [Trace ID: ${correlationId}] [Kafka Consumer] Discarding duplicate event. request_id already processed.`);
-          return; // Safe discard to prevent Kafka duplicate write loops (At-Least-Once Delivery safety)
-        }
+        // If this is an ASYNC_PLACE_ORDER event, execute the order processing transaction
+        if (eventType === 'ASYNC_PLACE_ORDER') {
+          const idempotencyKey = `idempotency:order:${eventId || message.key?.toString()}`;
+          const isLockAcquired = await redisService.acquireIdempotencyLock(idempotencyKey, 86400);
 
-        // Reserve key in Redis immediately with 24 Hours TTL (86400 seconds)
-        await redis.setex(redisKey, 86400, 'processing');
-
-        // ── 6. ATOMIC TRANSACTION LAYER (Mongoose Transactions) ────────────
-        const session = await mongoose.startSession();
-        session.startTransaction();
-
-        try {
-          const { payload, userId } = data;
-          const itemsList = payload.meta?.items || [];
-          const orderItems = [];
-          const orderSummary = [];
-          let totalAmount = 0;
-          let totalCOGS = 0;
-
-          if (itemsList.length === 0) {
-            throw new Error('Order items list is empty.');
+          if (!isLockAcquired) {
+            console.warn(`⚠️ [OrderConsumer] Duplicate event detected for key: ${idempotencyKey}. Discarding.`);
+            return;
           }
 
-          // Process each order item atomically within the Mongoose Session
-          for (const item of itemsList) {
-            let dbProd = await Product.findOne({
-              name: { $regex: new RegExp(`^${item.name?.trim()}$`, 'i') }
-            }).session(session);
+          console.log(`📥 [OrderConsumer] [Corr: ${correlationId}] Processing ASYNC_PLACE_ORDER transaction (EventId: ${eventId})`);
 
-            if (!dbProd && item.product_id) {
-              dbProd = await Product.findById(item.product_id).session(session);
+          const session = await mongoose.startSession();
+          session.startTransaction();
+
+          try {
+            const itemsList = payload?.items || [];
+            if (itemsList.length === 0) {
+              throw new Error('Order items list is empty.');
             }
 
-            if (!dbProd) {
-              throw new Error(`Product not found in stock: ${item.name || item.product_id}`);
+            let totalAmount = 0;
+            let totalCOGS = 0;
+            const orderItems = [];
+
+            for (const item of itemsList) {
+              let dbProd = await Product.findOne({
+                shop: shopId,
+                $or: [
+                  { _id: mongoose.isValidObjectId(item.product) ? item.product : undefined },
+                  { name: { $regex: new RegExp(`^${item.name?.trim()}$`, 'i') } },
+                ].filter(Boolean),
+              }).session(session);
+
+              if (!dbProd) {
+                throw new Error(`Product not found: ${item.name || item.product}`);
+              }
+
+              const qty = Number(item.quantity || 1);
+              if (dbProd.quantity < qty) {
+                console.warn(`[OrderConsumer] Insufficient stock for ${dbProd.name}. Available: ${dbProd.quantity}, Capping.`);
+                dbProd.quantity = 0;
+              } else {
+                dbProd.quantity -= qty;
+              }
+              await dbProd.save({ session });
+
+              const subtotal = dbProd.sellingPrice * qty;
+              totalAmount += subtotal;
+              totalCOGS += dbProd.costPrice * qty;
+
+              orderItems.push({
+                product: dbProd._id,
+                productName: dbProd.name,
+                sku: dbProd.sku,
+                unitPrice: dbProd.sellingPrice,
+                costPrice: dbProd.costPrice,
+                quantity: qty,
+                subtotal,
+              });
             }
 
-            const qty = Number(item.quantity || 1);
+            const [newOrder] = await Order.create(
+              [{
+                shop: shopId,
+                customer: payload.customer || { name: 'Walk-in Customer' },
+                items: orderItems,
+                totalAmount,
+                discount: payload.discount || 0,
+                finalAmount: Math.max(0, totalAmount - (payload.discount || 0)),
+                status: 'Completed',
+              }],
+              { session }
+            );
 
-            // Deduct stock safely inside transaction
-            if (dbProd.quantity < qty) {
-              console.warn(`[Trace ID: ${correlationId}] Insufficient stock for ${dbProd.name}. Current: ${dbProd.quantity}, Requested: ${qty}. Capping deduction.`);
-              dbProd.quantity = 0;
-            } else {
-              dbProd.quantity -= qty;
-            }
-            await dbProd.save({ session });
+            await Sale.create(
+              [{
+                shop: shopId,
+                order: newOrder._id,
+                revenue: newOrder.finalAmount,
+                costOfGoodsSold: totalCOGS,
+                date: new Date(),
+                notes: `Async Order: ${newOrder.orderNumber}`,
+              }],
+              { session }
+            );
 
-            const subtotal = dbProd.sellingPrice * qty;
-            totalAmount += subtotal;
-            totalCOGS += dbProd.costPrice * qty;
+            await session.commitTransaction();
+            session.endSession();
 
-            orderItems.push({
-              product: dbProd._id,
-              productName: dbProd.name,
-              sku: dbProd.sku,
-              unitPrice: dbProd.sellingPrice,
-              costPrice: dbProd.costPrice,
-              quantity: qty,
-              subtotal
-            });
-            orderSummary.push(`${qty} ${dbProd.name}`);
+            await redisService.completeIdempotency(idempotencyKey, 86400);
+            console.log(`✅ [OrderConsumer] Order ${newOrder.orderNumber} successfully processed.`);
+          } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            await redisService.releaseIdempotencyLock(idempotencyKey);
+            console.error(`❌ [OrderConsumer] Transaction failed:`, txErr.message);
           }
-
-          // Create standard Mongoose Order document
-          const today = new Date();
-          const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
-          const orderCount = await Order.countDocuments({}).session(session);
-          const orderNumber = `ORD-${dateStr}-${String(orderCount + 1).padStart(3, '0')}`;
-
-          const newOrder = await Order.create([{
-            shop: userId || new mongoose.Types.ObjectId(), // Org scope assignment
-            orderNumber,
-            customer: {
-              name: payload.meta?.customerName || 'Walk-in Customer'
-            },
-            items: orderItems,
-            totalAmount,
-            finalAmount: totalAmount,
-            status: 'Completed'
-          }], { session });
-
-          // Create corresponding Sales ledger record
-          await Sale.create([{
-            shop: userId || new mongoose.Types.ObjectId(),
-            order: newOrder[0]._id,
-            revenue: totalAmount,
-            costOfGoodsSold: totalCOGS,
-            date: new Date(),
-            notes: `Async Event Order: ${orderSummary.join(', ')}`,
-          }], { session });
-
-          // Commit transaction atomically
-          await session.commitTransaction();
-          session.endSession();
-
-          // Mark Redis idempotency key as fully complete
-          await redis.setex(redisKey, 86400, 'completed');
-          console.log(`✅ [Trace ID: ${correlationId}] [Kafka Consumer] Order processed successfully. Order Number: ${orderNumber}`);
-
-        } catch (dbErr) {
-          // Abort transaction to prevent orphan stock changes or partial writes
-          console.error(`❌ [Trace ID: ${correlationId}] [Kafka Consumer] Mongoose Transaction aborted. Rolling back changes.`);
-          console.error(`   Rollback Reason: ${dbErr.message}`);
-          await session.abortTransaction();
-          session.endSession();
-
-          // Clear Redis key block to allow potential retries of this message
-          await redis.del(redisKey);
-          throw dbErr; // Throw to trigger KafkaJS standard offset retry policy
         }
-      }
+      },
     });
-
   } catch (err) {
-    console.error('💥 [RetailFlow Kafka Consumer] Fatal worker exception:', err.message);
+    isRunning = false;
+    console.error('💥 [OrderConsumer] Connection error:', err.message);
   }
 }
 
-// ── 5. GRACEFUL WORKER SHUTDOWN HOOKS ────────────────────────────────────────
+async function stopOrderConsumer() {
+  if (consumer && isRunning) {
+    try {
+      await consumer.disconnect();
+      isRunning = false;
+      console.log('✅ [OrderConsumer] Disconnected gracefully.');
+    } catch (err) {
+      console.error('[OrderConsumer] Disconnect error:', err.message);
+    }
+  }
+}
+
+// Graceful shutdown
 const handleShutdown = async (signal) => {
-  console.log(`\n🛑 Received ${signal}. Shutting down worker...`);
+  console.log(`\n🛑 [OrderConsumer] Received ${signal}. Shutting down...`);
   try {
-    await consumer.disconnect();
-    console.log('✅ Kafka Consumer disconnected.');
-    await redis.quit();
-    console.log('✅ Redis pool connections closed.');
+    await stopOrderConsumer();
     await mongoose.disconnect();
-    console.log('✅ MongoDB connection closed. Exiting.');
     process.exit(0);
   } catch (err) {
-    console.error('Error during shutdown operations:', err.message);
+    console.error('Error during shutdown:', err.message);
     process.exit(1);
   }
 };
@@ -224,4 +183,8 @@ const handleShutdown = async (signal) => {
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
-startConsumer();
+if (require.main === module) {
+  startOrderConsumer();
+}
+
+module.exports = { startOrderConsumer, stopOrderConsumer, getConsumer: () => consumer };

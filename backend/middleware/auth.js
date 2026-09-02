@@ -3,13 +3,11 @@ const User = require('../models/User');
 const ErrorResponse = require('../utils/errorResponse');
 
 /**
- * protect — Verifies the JWT and attaches the authenticated user to req.user.
- * Apply this middleware to any route that requires authentication.
+ * protect — Verifies JWT and attaches current authenticated shop owner to req.user
  */
 exports.protect = async (req, res, next) => {
   let token;
 
-  // Accept token from Authorization header: "Bearer <token>"
   if (
     req.headers.authorization &&
     req.headers.authorization.startsWith('Bearer')
@@ -22,10 +20,7 @@ exports.protect = async (req, res, next) => {
   }
 
   try {
-    // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Attach the full user document (excluding password) to the request
     req.user = await User.findById(decoded.id);
 
     if (!req.user) {

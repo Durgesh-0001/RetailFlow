@@ -32,6 +32,7 @@ const OrderSchema = new mongoose.Schema(
     },
     customer: {
       name:  { type: String, trim: true, default: 'Walk-in Customer' },
+      email: { type: String, trim: true, lowercase: true },
       phone: { type: String, trim: true },
     },
     items: {
@@ -45,6 +46,7 @@ const OrderSchema = new mongoose.Schema(
       type: String,
       enum: ['Pending', 'Processing', 'Completed', 'Cancelled'],
       default: 'Pending',
+      index: true,
     },
     notes: { type: String, trim: true },
   },
@@ -53,13 +55,13 @@ const OrderSchema = new mongoose.Schema(
 
 // ─── Auto-generate order number before saving ────────────────────────────────
 OrderSchema.pre('save', async function (next) {
-  if (this.isNew) {
+  if (this.isNew && !this.orderNumber) {
     const today = new Date();
     const dateStr = today.toISOString().slice(0, 10).replace(/-/g, '');
     const count = await this.constructor.countDocuments({
       createdAt: {
-        $gte: new Date(today.setHours(0, 0, 0, 0)),
-        $lte: new Date(today.setHours(23, 59, 59, 999)),
+        $gte: new Date(new Date().setHours(0, 0, 0, 0)),
+        $lte: new Date(new Date().setHours(23, 59, 59, 999)),
       },
     });
     this.orderNumber = `ORD-${dateStr}-${String(count + 1).padStart(3, '0')}`;

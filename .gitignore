@@ -37,7 +37,7 @@ lerna-debug.log*
 .DS_Store
 Thumbs.db
 desktop.ini
-
+docker-compose.yaml
 # ========================
 # Editor & IDE
 # ========================

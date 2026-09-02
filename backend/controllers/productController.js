@@ -1,11 +1,18 @@
 const Product = require('../models/Product');
 const ErrorResponse = require('../utils/errorResponse');
+const redisService = require('../services/redisService');
+const kafkaService = require('../services/kafkaService');
+const emailService = require('../services/emailService');
 
-// Escape regex special characters in user-supplied search terms before
-// dropping them into a $regex query. Without this, a search like "a(b"
-// throws an invalid-regex error (500), and characters like ".*" let a
-// caller build unintended wildcard/DoS-prone patterns.
 const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Helper to invalidate product and analytics caches
+const invalidateShopCaches = async (shopId) => {
+  await Promise.all([
+    redisService.invalidatePattern(`cache:http:${shopId}:*`),
+    redisService.invalidatePattern(`cache:analytics:*:${shopId}`),
+  ]);
+};
 
 // ─── @desc  Get all products for the logged-in shop
 // ─── @route GET /api/v1/products
@@ -13,7 +20,6 @@ const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 exports.getProducts = async (req, res, next) => {
   try {
     const { category, search, stockStatus } = req.query;
-
     const query = { shop: req.user._id };
 
     if (category) query.category = { $regex: escapeRegex(category), $options: 'i' };
@@ -21,7 +27,6 @@ exports.getProducts = async (req, res, next) => {
 
     let products = await Product.find(query).sort({ createdAt: -1 });
 
-    // Filter by stockStatus virtual (done in-memory since it's a virtual)
     if (stockStatus) {
       products = products.filter((p) => p.stockStatus === stockStatus);
     }
@@ -37,7 +42,6 @@ exports.getProducts = async (req, res, next) => {
 // ─── @access Protected
 exports.getLowStockProducts = async (req, res, next) => {
   try {
-    // quantity == 0 OR quantity <= threshold (using aggregation for the comparison)
     const products = await Product.find({
       shop: req.user._id,
       $expr: { $lte: ['$quantity', '$lowStockThreshold'] },
@@ -72,6 +76,8 @@ exports.createProduct = async (req, res, next) => {
     req.body.shop = req.user._id;
     const product = await Product.create(req.body);
 
+    await invalidateShopCaches(req.user._id);
+
     res.status(201).json({ success: true, data: product });
   } catch (err) {
     next(err);
@@ -83,7 +89,6 @@ exports.createProduct = async (req, res, next) => {
 // ─── @access Protected
 exports.updateProduct = async (req, res, next) => {
   try {
-    // Prevent changing the owning shop
     delete req.body.shop;
 
     const product = await Product.findOneAndUpdate(
@@ -94,18 +99,20 @@ exports.updateProduct = async (req, res, next) => {
 
     if (!product) return next(new ErrorResponse('Product not found.', 404));
 
+    await invalidateShopCaches(req.user._id);
+
     res.status(200).json({ success: true, data: product });
   } catch (err) {
     next(err);
   }
 };
 
-// ─── @desc  Adjust stock quantity only (increment/decrement)
+// ─── @desc  Adjust stock quantity (increment/decrement)
 // ─── @route PATCH /api/v1/products/:id/stock
 // ─── @access Protected
 exports.adjustStock = async (req, res, next) => {
   try {
-    const { adjustment } = req.body; // positive = add, negative = remove
+    const { adjustment } = req.body;
 
     if (adjustment === undefined) {
       return next(new ErrorResponse('Please provide an adjustment value (positive or negative).', 400));
@@ -122,6 +129,16 @@ exports.adjustStock = async (req, res, next) => {
     product.quantity = newQty;
     await product.save();
 
+    await invalidateShopCaches(req.user._id);
+
+    // Stream stock update event to Kafka
+    kafkaService.publishStockUpdated(product, adjustment, req.user).catch(() => {});
+
+    // If stock hit or fell below threshold, dispatch low-stock email alert
+    if (product.quantity <= product.lowStockThreshold) {
+      emailService.sendLowStockAlert(product, req.user).catch(() => {});
+    }
+
     res.status(200).json({ success: true, data: product });
   } catch (err) {
     next(err);
@@ -136,6 +153,8 @@ exports.deleteProduct = async (req, res, next) => {
     const product = await Product.findOneAndDelete({ _id: req.params.id, shop: req.user._id });
 
     if (!product) return next(new ErrorResponse('Product not found.', 404));
+
+    await invalidateShopCaches(req.user._id);
 
     res.status(200).json({ success: true, message: 'Product deleted successfully.' });
   } catch (err) {

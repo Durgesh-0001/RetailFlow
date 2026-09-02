@@ -1,9 +1,7 @@
 const User = require('../models/User');
 const ErrorResponse = require('../utils/errorResponse');
 
-// ─────────────────────────────────────────────
-// Helper: create token and send JSON response
-// ─────────────────────────────────────────────
+// Helper to generate JWT and return response
 const sendTokenResponse = (user, statusCode, res) => {
   const token = user.getSignedJwt();
 
@@ -23,11 +21,9 @@ const sendTokenResponse = (user, statusCode, res) => {
   });
 };
 
-// ─────────────────────────────────────────────
-// @desc    Register a new shop owner
-// @route   POST /api/v1/auth/register
-// @access  Public
-// ─────────────────────────────────────────────
+// ─── @desc Register a new shop owner
+// ─── @route POST /api/v1/auth/register
+// ─── @access Public
 exports.register = async (req, res, next) => {
   try {
     const { shopName, ownerName, email, password, phone, address } = req.body;
@@ -47,21 +43,17 @@ exports.register = async (req, res, next) => {
   }
 };
 
-// ─────────────────────────────────────────────
-// @desc    Login shop owner
-// @route   POST /api/v1/auth/login
-// @access  Public
-// ─────────────────────────────────────────────
+// ─── @desc Login shop owner
+// ─── @route POST /api/v1/auth/login
+// ─── @access Public
 exports.login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
 
-    // Validate that both fields are provided
     if (!email || !password) {
       return next(new ErrorResponse('Please provide an email and password.', 400));
     }
 
-    // Find user and explicitly select password (it's hidden by default)
     const user = await User.findOne({ email }).select('+password');
 
     if (!user) {
@@ -69,7 +61,6 @@ exports.login = async (req, res, next) => {
     }
 
     const isMatch = await user.matchPassword(password);
-
     if (!isMatch) {
       return next(new ErrorResponse('Invalid credentials.', 401));
     }
@@ -80,14 +71,11 @@ exports.login = async (req, res, next) => {
   }
 };
 
-// ─────────────────────────────────────────────
-// @desc    Get currently logged-in owner profile
-// @route   GET /api/v1/auth/me
-// @access  Protected
-// ─────────────────────────────────────────────
+// ─── @desc Get logged-in shop owner profile
+// ─── @route GET /api/v1/auth/me
+// ─── @access Protected
 exports.getMe = async (req, res, next) => {
   try {
-    // req.user is set by the protect middleware
     res.status(200).json({
       success: true,
       user: req.user,
@@ -97,14 +85,11 @@ exports.getMe = async (req, res, next) => {
   }
 };
 
-// ─────────────────────────────────────────────
-// @desc    Update shop owner profile / shop settings
-// @route   PUT /api/v1/auth/me
-// @access  Protected
-// ─────────────────────────────────────────────
+// ─── @desc Update shop owner profile / shop settings
+// ─── @route PUT /api/v1/auth/me
+// ─── @access Protected
 exports.updateMe = async (req, res, next) => {
   try {
-    // Fields allowed to be updated (never allow password here)
     const allowedFields = ['shopName', 'ownerName', 'phone', 'address', 'currency', 'currencySymbol'];
     const updateData = {};
 
@@ -115,8 +100,8 @@ exports.updateMe = async (req, res, next) => {
     });
 
     const user = await User.findByIdAndUpdate(req.user._id, updateData, {
-      new: true,           // Return the updated document
-      runValidators: true, // Run schema validators on update
+      new: true,
+      runValidators: true,
     });
 
     res.status(200).json({

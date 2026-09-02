@@ -3,6 +3,16 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Sale = require('../models/Sale');
 const ErrorResponse = require('../utils/errorResponse');
+const kafkaService = require('../services/kafkaService');
+const redisService = require('../services/redisService');
+
+// Helper to invalidate order & analytics caches
+const invalidateOrderCaches = async (shopId) => {
+  await Promise.all([
+    redisService.invalidatePattern(`cache:http:${shopId}:*`),
+    redisService.invalidatePattern(`cache:analytics:*:${shopId}`),
+  ]);
+};
 
 // ─── @desc  Get all orders (filterable by status)
 // ─── @route GET /api/v1/orders?status=Pending
@@ -35,21 +45,17 @@ exports.getOrder = async (req, res, next) => {
   }
 };
 
-// ─── @desc  Create a new order (auto-deducts stock)
+// ─── @desc  Create a new order (auto-deducts stock atomically)
 // ─── @route POST /api/v1/orders
 // ─── @access Protected
 exports.createOrder = async (req, res, next) => {
-  // Use a session for atomicity: if stock deduction fails, order is rolled back
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    const { customer, items, discount = 0, notes } = req.body;
+    const { customer, items, discount = 0, notes, status = 'Completed' } = req.body;
 
     if (!items || items.length === 0) {
-      // The transaction session was already started above — abort and end
-      // it before bailing out, otherwise this leaves a hanging transaction
-      // open on the connection every time someone submits an empty cart.
       await session.abortTransaction();
       session.endSession();
       return next(new ErrorResponse('Order must contain at least one item.', 400));
@@ -58,6 +64,7 @@ exports.createOrder = async (req, res, next) => {
     let totalAmount = 0;
     let totalCOGS   = 0;
     const resolvedItems = [];
+    const lowStockAlerts = [];
 
     for (const item of items) {
       const product = await Product.findOne({
@@ -67,11 +74,13 @@ exports.createOrder = async (req, res, next) => {
 
       if (!product) {
         await session.abortTransaction();
+        session.endSession();
         return next(new ErrorResponse(`Product ${item.product} not found.`, 404));
       }
 
       if (product.quantity < item.quantity) {
         await session.abortTransaction();
+        session.endSession();
         return next(
           new ErrorResponse(
             `Insufficient stock for "${product.name}". Available: ${product.quantity}, Requested: ${item.quantity}.`,
@@ -80,9 +89,13 @@ exports.createOrder = async (req, res, next) => {
         );
       }
 
-      // Deduct stock
+      // Deduct stock inside transaction
       product.quantity -= item.quantity;
       await product.save({ session });
+
+      if (product.quantity <= product.lowStockThreshold) {
+        lowStockAlerts.push(product);
+      }
 
       const subtotal = product.sellingPrice * item.quantity;
       totalAmount += subtotal;
@@ -99,15 +112,47 @@ exports.createOrder = async (req, res, next) => {
       });
     }
 
-    const finalAmount = totalAmount - discount;
+    const finalAmount = Math.max(0, totalAmount - discount);
 
     const [order] = await Order.create(
-      [{ shop: req.user._id, customer, items: resolvedItems, totalAmount, discount, finalAmount, notes }],
+      [{
+        shop: req.user._id,
+        customer,
+        items: resolvedItems,
+        totalAmount,
+        discount,
+        finalAmount,
+        status,
+        notes,
+      }],
       { session }
     );
 
+    // Auto-create Sale ledger record if order is Completed
+    if (status === 'Completed') {
+      await Sale.create(
+        [{
+          shop: req.user._id,
+          order: order._id,
+          date: new Date(),
+          revenue: finalAmount,
+          costOfGoodsSold: totalCOGS,
+          notes: `Auto-logged from Order ${order.orderNumber}`,
+        }],
+        { session }
+      );
+    }
+
     await session.commitTransaction();
     session.endSession();
+
+    // Invalidate Redis caches
+    invalidateOrderCaches(req.user._id).catch(() => {});
+
+    // Stream ORDER_CREATED event to Kafka for downstream consumers (Email, Analytics)
+    kafkaService.publishOrderCreated(order, req.user).catch((e) => {
+      console.warn('⚠️ [orderController] Kafka publish failed (non-blocking):', e.message);
+    });
 
     res.status(201).json({ success: true, data: order });
   } catch (err) {
@@ -121,43 +166,79 @@ exports.createOrder = async (req, res, next) => {
 // ─── @route PATCH /api/v1/orders/:id/status
 // ─── @access Protected
 exports.updateOrderStatus = async (req, res, next) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { status } = req.body;
     const validStatuses = ['Pending', 'Processing', 'Completed', 'Cancelled'];
 
     if (!status || !validStatuses.includes(status)) {
+      await session.abortTransaction();
+      session.endSession();
       return next(new ErrorResponse(`Invalid status. Must be one of: ${validStatuses.join(', ')}.`, 400));
     }
 
-    const order = await Order.findOne({ _id: req.params.id, shop: req.user._id });
-    if (!order) return next(new ErrorResponse('Order not found.', 404));
+    const order = await Order.findOne({ _id: req.params.id, shop: req.user._id }).session(session);
+    if (!order) {
+      await session.abortTransaction();
+      session.endSession();
+      return next(new ErrorResponse('Order not found.', 404));
+    }
 
     const previousStatus = order.status;
     order.status = status;
-    await order.save();
 
-    // ── Auto-create a Sale record when order is marked Completed ──────────────
+    // Handle Completed status -> create Sale record if not already created
     if (status === 'Completed' && previousStatus !== 'Completed') {
-      const revenue = order.finalAmount;
-      const cogs    = order.items.reduce((sum, item) => sum + item.costPrice * item.quantity, 0);
-
-      await Sale.create({
-        shop: req.user._id,
-        order: order._id,
-        date: new Date(),
-        revenue,
-        costOfGoodsSold: cogs,
-        notes: `Auto-logged from Order ${order.orderNumber}`,
-      });
+      const existingSale = await Sale.findOne({ order: order._id, shop: req.user._id }).session(session);
+      if (!existingSale) {
+        const cogs = order.items.reduce((sum, item) => sum + item.costPrice * item.quantity, 0);
+        await Sale.create(
+          [{
+            shop: req.user._id,
+            order: order._id,
+            date: new Date(),
+            revenue: order.finalAmount,
+            costOfGoodsSold: cogs,
+            notes: `Auto-logged from Order ${order.orderNumber}`,
+          }],
+          { session }
+        );
+      }
     }
+
+    // Handle Cancelled status -> restore stock & remove Sale if cancelling a completed order
+    if (status === 'Cancelled' && previousStatus !== 'Cancelled') {
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(
+          item.product,
+          { $inc: { quantity: item.quantity } },
+          { session }
+        );
+      }
+      await Sale.findOneAndDelete({ order: order._id, shop: req.user._id }).session(session);
+    }
+
+    await order.save({ session });
+    await session.commitTransaction();
+    session.endSession();
+
+    // Invalidate Redis caches
+    invalidateOrderCaches(req.user._id).catch(() => {});
+
+    // Stream ORDER_STATUS_UPDATED event to Kafka
+    kafkaService.publishOrderStatusUpdated(order, previousStatus, req.user).catch(() => {});
 
     res.status(200).json({ success: true, data: order });
   } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
     next(err);
   }
 };
 
-// ─── @desc  Delete / cancel an order
+// ─── @desc  Delete an order
 // ─── @route DELETE /api/v1/orders/:id
 // ─── @access Protected
 exports.deleteOrder = async (req, res, next) => {
@@ -173,31 +254,28 @@ exports.deleteOrder = async (req, res, next) => {
       return next(new ErrorResponse('Order not found.', 404));
     }
 
-    // Restore the stock that was deducted at creation time. The previous
-    // version deleted the order outright without giving inventory back,
-    // so every deleted/cancelled order permanently lost that stock.
-    for (const item of order.items) {
-      await Product.findByIdAndUpdate(
-        item.product,
-        { $inc: { quantity: item.quantity } },
-        { session }
-      );
+    // Restore stock if not already cancelled
+    if (order.status !== 'Cancelled') {
+      for (const item of order.items) {
+        await Product.findByIdAndUpdate(
+          item.product,
+          { $inc: { quantity: item.quantity } },
+          { session }
+        );
+      }
     }
 
-    // If the order had already been marked Completed, updateOrderStatus
-    // auto-created a matching Sale record for it. Deleting the order
-    // without deleting that Sale left a dangling record pointing at a
-    // non-existent order and kept inflating revenue/profit reports.
-    if (order.status === 'Completed') {
-      await Sale.findOneAndDelete({ order: order._id, shop: req.user._id }).session(session);
-    }
-
+    // Delete matching Sale record if exists
+    await Sale.findOneAndDelete({ order: order._id, shop: req.user._id }).session(session);
     await Order.findByIdAndDelete(order._id).session(session);
 
     await session.commitTransaction();
     session.endSession();
 
-    res.status(200).json({ success: true, message: 'Order deleted successfully and stock restored.' });
+    // Invalidate Redis caches
+    invalidateOrderCaches(req.user._id).catch(() => {});
+
+    res.status(200).json({ success: true, message: 'Order deleted successfully and inventory adjusted.' });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();

@@ -17,17 +17,22 @@ const EmployeeSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
-    role: {
+    email: {
       type: String,
       trim: true,
-      default: 'Staff',
+      lowercase: true,
+    },
+    role: {
+      type: String,
+      default: 'Staff', // e.g. Cashier, Helper, Manager, Stock Boy
+      trim: true,
     },
     salary: {
       type: Number,
-      min: [0, 'Salary cannot be negative'],
       default: 0,
+      min: [0, 'Salary cannot be negative'],
     },
-    joinDate: {
+    joiningDate: {
       type: Date,
       default: Date.now,
     },

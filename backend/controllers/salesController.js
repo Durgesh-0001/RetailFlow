@@ -1,7 +1,7 @@
 const Sale = require('../models/Sale');
 const ErrorResponse = require('../utils/errorResponse');
+const redisService = require('../services/redisService');
 
-// ─── Helper: build a date range for a given day ──────────────────────────────
 const dayRange = (dateStr) => {
   const start = new Date(dateStr);
   start.setHours(0, 0, 0, 0);
@@ -10,7 +10,14 @@ const dayRange = (dateStr) => {
   return { start, end };
 };
 
-// ─── @desc  Get all sales (optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filter)
+const invalidateSalesCaches = async (shopId) => {
+  await Promise.all([
+    redisService.invalidatePattern(`cache:analytics:*:${shopId}`),
+    redisService.invalidatePattern(`cache:http:${shopId}:*`),
+  ]);
+};
+
+// ─── @desc  Get all sales
 // ─── @route GET /api/v1/sales
 // ─── @access Protected
 exports.getSales = async (req, res, next) => {
@@ -23,7 +30,7 @@ exports.getSales = async (req, res, next) => {
       if (req.query.to)   query.date.$lte = new Date(req.query.to + 'T23:59:59.999Z');
     }
 
-    const sales = await Sale.find(query).populate('order', 'orderNumber').sort({ date: -1 });
+    const sales = await Sale.find(query).populate('order', 'orderNumber customer').sort({ date: -1 });
 
     res.status(200).json({ success: true, count: sales.length, data: sales });
   } catch (err) {
@@ -62,7 +69,7 @@ exports.getDailySummary = async (req, res, next) => {
   }
 };
 
-// ─── @desc  Get monthly revenue & profit breakdown (day-by-day)
+// ─── @desc  Get monthly revenue & profit breakdown
 // ─── @route GET /api/v1/sales/monthly?month=5&year=2024
 // ─── @access Protected
 exports.getMonthlySummary = async (req, res, next) => {
@@ -117,6 +124,8 @@ exports.createSale = async (req, res, next) => {
     req.body.shop = req.user._id;
     const sale = await Sale.create(req.body);
 
+    await invalidateSalesCaches(req.user._id);
+
     res.status(201).json({ success: true, data: sale });
   } catch (err) {
     next(err);
@@ -138,6 +147,8 @@ exports.updateSale = async (req, res, next) => {
 
     if (!sale) return next(new ErrorResponse('Sale record not found.', 404));
 
+    await invalidateSalesCaches(req.user._id);
+
     res.status(200).json({ success: true, data: sale });
   } catch (err) {
     next(err);
@@ -152,6 +163,8 @@ exports.deleteSale = async (req, res, next) => {
     const sale = await Sale.findOneAndDelete({ _id: req.params.id, shop: req.user._id });
 
     if (!sale) return next(new ErrorResponse('Sale record not found.', 404));
+
+    await invalidateSalesCaches(req.user._id);
 
     res.status(200).json({ success: true, message: 'Sale deleted successfully.' });
   } catch (err) {
